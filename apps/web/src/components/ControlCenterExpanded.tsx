@@ -11,6 +11,7 @@ import { Button } from '@/components/ui/button'
 import { Slider } from '@/components/ui/slider'
 import { Switch } from '@/components/ui/switch'
 import { Separator } from '@/components/ui/separator'
+import { Input } from '@/components/ui/input'
 import {
   Select,
   SelectContent,
@@ -112,6 +113,22 @@ export function ControlCenterExpanded({ machineState, profileAuthor }: ControlCe
   const [machineProfiles, setMachineProfiles] = useState<{ id: string; name: string }[]>([])
   const [profilesLoaded, setProfilesLoaded] = useState(false)
 
+  // Advanced machine settings fetched from /api/machine/settings. These
+  // are not exposed over MQTT, so we pull them on demand and write back
+  // through POST /api/machine/settings.
+  const [heatingTimeout, setHeatingTimeout] = useState<string>('')
+  const [updateChannel, setUpdateChannel] = useState<string>('')
+  const [hostnameOverride, setHostnameOverride] = useState<string>('')
+  const [advancedLoaded, setAdvancedLoaded] = useState(false)
+  const [advancedSaving, setAdvancedSaving] = useState(false)
+  // Track the last-synced machine values so we can show a Save-enabled
+  // state only when the user has actually changed something.
+  const advancedInitialRef = useRef<{
+    heating_timeout: number
+    update_channel: string
+    hostname_override: string
+  } | null>(null)
+
   // Shared state derivation + command executor
   const {
     isIdle, isBrewing, isPreheating, isReady,
@@ -163,6 +180,89 @@ export function ControlCenterExpanded({ machineState, profileAuthor }: ControlCe
     })()
     return () => { cancelled = true }
   }, [])
+
+  // Fetch advanced settings once the machine is online. Re-fetch if the
+  // connection recovers.
+  useEffect(() => {
+    if (!isConnected || advancedLoaded) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const base = await getServerUrl()
+        const res = await fetch(`${base}/api/machine/settings`)
+        if (!res.ok || cancelled) return
+        const data = await res.json()
+        const initial = {
+          heating_timeout: Number(data.heating_timeout ?? 0),
+          update_channel: String(data.update_channel ?? ''),
+          hostname_override: String(data.hostname_override ?? ''),
+        }
+        advancedInitialRef.current = initial
+        setHeatingTimeout(String(initial.heating_timeout))
+        setUpdateChannel(initial.update_channel)
+        setHostnameOverride(initial.hostname_override)
+        setAdvancedLoaded(true)
+      } catch {
+        // Silently ignore — Advanced section stays disabled
+      }
+    })()
+    return () => { cancelled = true }
+  }, [isConnected, advancedLoaded])
+
+  const advancedDirty =
+    advancedInitialRef.current !== null && (
+      Number(heatingTimeout) !== advancedInitialRef.current.heating_timeout ||
+      updateChannel !== advancedInitialRef.current.update_channel ||
+      hostnameOverride !== advancedInitialRef.current.hostname_override
+    )
+
+  const handleAdvancedSave = useCallback(async () => {
+    const initial = advancedInitialRef.current
+    if (!initial) return
+    const payload: Record<string, unknown> = {}
+    const heatingNum = Number(heatingTimeout)
+    if (Number.isFinite(heatingNum) && heatingNum !== initial.heating_timeout) {
+      if (heatingNum < 1 || heatingNum > 120) {
+        toast.error(t('controlCenter.toasts.heatingTimeoutRange', { defaultValue: 'Heating timeout must be 1–120 minutes' }))
+        return
+      }
+      payload.heating_timeout = heatingNum
+    }
+    if (updateChannel !== initial.update_channel) {
+      payload.update_channel = updateChannel
+    }
+    if (hostnameOverride !== initial.hostname_override) {
+      payload.hostname_override = hostnameOverride
+    }
+    if (Object.keys(payload).length === 0) return
+
+    setAdvancedSaving(true)
+    try {
+      const base = await getServerUrl()
+      const res = await fetch(`${base}/api/machine/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        toast.error((err as { detail?: string }).detail ?? t('controlCenter.toasts.error'))
+        return
+      }
+      advancedInitialRef.current = {
+        heating_timeout: payload.heating_timeout != null
+          ? (payload.heating_timeout as number)
+          : initial.heating_timeout,
+        update_channel: (payload.update_channel as string | undefined) ?? initial.update_channel,
+        hostname_override: (payload.hostname_override as string | undefined) ?? initial.hostname_override,
+      }
+      toast.success(t('controlCenter.toasts.settingsSaved', { defaultValue: 'Settings saved' }))
+    } catch {
+      toast.error(t('controlCenter.toasts.error'))
+    } finally {
+      setAdvancedSaving(false)
+    }
+  }, [heatingTimeout, updateChannel, hostnameOverride, t])
 
   const handleBrightnessChange = useCallback(
     async (val: number[]) => {
@@ -363,6 +463,87 @@ export function ControlCenterExpanded({ machineState, profileAuthor }: ControlCe
               onCheckedChange={handleSoundsToggle}
               disabled={!isConnected}
             />
+          </div>
+        </div>
+      </section>
+
+      <Separator />
+
+      {/* ── Advanced ──────────────────────────────────── */}
+      <section>
+        <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">
+          {t('controlCenter.sections.advanced', { defaultValue: 'Advanced' })}
+        </h4>
+        <div className="space-y-3 text-sm">
+          {/* Heating timeout */}
+          <div className="flex items-center justify-between gap-3">
+            <label htmlFor="cc-heating-timeout" className="text-foreground">
+              {t('controlCenter.labels.heatingTimeout', { defaultValue: 'Heating timeout (min)' })}
+            </label>
+            <Input
+              id="cc-heating-timeout"
+              type="number"
+              min={1}
+              max={120}
+              value={heatingTimeout}
+              onChange={(e) => setHeatingTimeout(e.target.value)}
+              disabled={!isConnected || !advancedLoaded || advancedSaving}
+              className="w-24 h-8"
+            />
+          </div>
+
+          {/* Update channel */}
+          <div className="flex items-center justify-between gap-3">
+            <label className="text-foreground">
+              {t('controlCenter.labels.updateChannel', { defaultValue: 'Update channel' })}
+            </label>
+            <Select
+              value={updateChannel || undefined}
+              onValueChange={setUpdateChannel}
+              disabled={!isConnected || !advancedLoaded || advancedSaving}
+            >
+              <SelectTrigger className="w-36 h-8">
+                <SelectValue placeholder="—" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="stable">stable</SelectItem>
+                <SelectItem value="beta">beta</SelectItem>
+                <SelectItem value="nightly">nightly</SelectItem>
+                {/* Preserve an unknown channel the machine already reports */}
+                {updateChannel && !['stable', 'beta', 'nightly'].includes(updateChannel) && (
+                  <SelectItem value={updateChannel}>{updateChannel}</SelectItem>
+                )}
+              </SelectContent>
+            </Select>
+          </div>
+
+          {/* Hostname override */}
+          <div className="flex items-center justify-between gap-3">
+            <label htmlFor="cc-hostname" className="text-foreground">
+              {t('controlCenter.labels.hostnameOverride', { defaultValue: 'Hostname override' })}
+            </label>
+            <Input
+              id="cc-hostname"
+              type="text"
+              maxLength={63}
+              placeholder={t('controlCenter.placeholders.hostnameOverride', { defaultValue: '(auto)' })}
+              value={hostnameOverride}
+              onChange={(e) => setHostnameOverride(e.target.value)}
+              disabled={!isConnected || !advancedLoaded || advancedSaving}
+              className="w-40 h-8"
+            />
+          </div>
+
+          <div className="flex justify-end">
+            <Button
+              size="sm"
+              onClick={handleAdvancedSave}
+              disabled={!advancedDirty || !isConnected || advancedSaving}
+            >
+              {advancedSaving
+                ? t('controlCenter.actions.saving', { defaultValue: 'Saving…' })
+                : t('controlCenter.actions.save', { defaultValue: 'Save' })}
+            </Button>
           </div>
         </div>
       </section>

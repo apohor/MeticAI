@@ -230,6 +230,98 @@ async def command_sounds(body: SoundsRequest):
 
 
 # ---------------------------------------------------------------------------
+# Direct HTTP settings (not wired through the MQTT bridge)
+# ---------------------------------------------------------------------------
+
+# Whitelist of settings fields that ``POST /api/machine/settings`` accepts.
+# Each entry maps the JSON key to a (type, validator) pair. The validator
+# may raise ValueError to reject the value.
+_ALLOWED_SETTINGS: dict[str, type] = {
+    "heating_timeout": int,
+    "update_channel": str,
+    "hostname_override": str,  # None also allowed below
+}
+
+
+class SettingsPatch(BaseModel):
+    heating_timeout: int | None = Field(
+        None, ge=1, le=120,
+        description="Heating timeout in minutes (1–120).",
+    )
+    update_channel: str | None = Field(
+        None, min_length=1, max_length=32,
+        description="Firmware update channel (e.g. stable, beta, nightly).",
+    )
+    # Empty string means 'clear the override' → we forward it as None.
+    hostname_override: str | None = Field(
+        None, max_length=63,
+        description="Optional machine hostname override. Empty string clears it.",
+    )
+
+
+@router.get("/api/machine/settings")
+async def get_machine_settings():
+    """Return the machine's settings blob from its HTTP API.
+
+    Used by the UI to populate fields that are not exposed via MQTT
+    (e.g. ``heating_timeout``, ``update_channel``, ``hostname_override``).
+    """
+    snapshot = _get_snapshot()
+    _require_connected(snapshot)
+    from services.meticulous_service import (
+        _get_http_client,
+        _resolve_meticulous_base_url,
+    )
+    base_url = _resolve_meticulous_base_url()
+    try:
+        res = await _get_http_client().get(f"{base_url}/api/v1/settings", timeout=5.0)
+        res.raise_for_status()
+        return res.json()
+    except Exception as exc:
+        logger.error("Failed to fetch machine settings: %s", exc)
+        raise HTTPException(status_code=502, detail="Failed to reach machine")
+
+
+@router.post("/api/machine/settings")
+async def patch_machine_settings(body: SettingsPatch):
+    """Update a whitelisted subset of machine settings.
+
+    Posts directly to the machine's HTTP API because these settings are
+    not exposed over the MQTT bridge.
+    """
+    snapshot = _get_snapshot()
+    _require_connected(snapshot)
+
+    payload: dict = {}
+    # Only include keys the client actually provided.
+    data = body.model_dump(exclude_unset=True)
+    for key, value in data.items():
+        if key not in _ALLOWED_SETTINGS:
+            raise HTTPException(status_code=400, detail=f"Unknown setting: {key}")
+        if key == "hostname_override" and value == "":
+            value = None
+        payload[key] = value
+
+    if not payload:
+        raise HTTPException(status_code=400, detail="No settings provided")
+
+    from services.meticulous_service import (
+        _get_http_client,
+        _resolve_meticulous_base_url,
+    )
+    base_url = _resolve_meticulous_base_url()
+    try:
+        res = await _get_http_client().post(
+            f"{base_url}/api/v1/settings", json=payload, timeout=5.0,
+        )
+        res.raise_for_status()
+    except Exception as exc:
+        logger.error("Failed to patch settings %s: %s", list(payload), exc)
+        raise HTTPException(status_code=502, detail="Failed to reach machine")
+    return {"success": True, "status": "ok", "updated": payload}
+
+
+# ---------------------------------------------------------------------------
 # Machine discovery
 # ---------------------------------------------------------------------------
 
