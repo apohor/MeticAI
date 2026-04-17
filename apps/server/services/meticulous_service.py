@@ -10,6 +10,7 @@ import asyncio
 import os
 import functools
 import requests.exceptions
+from collections import OrderedDict
 from typing import Any, Dict, Optional
 from fastapi import HTTPException
 from logging_config import get_logger
@@ -68,6 +69,26 @@ _profile_list_cache: Optional[list] = None
 _profile_list_cache_time: float = 0.0
 _full_profile_cache: Optional[list] = None
 _full_profile_cache_time: float = 0.0
+
+# ---------------------------------------------------------------------------
+# Shot history caches
+# ---------------------------------------------------------------------------
+# Individual shot files (``(date, filename) -> dict``) are effectively
+# immutable once recorded, so we cache them aggressively with a bounded LRU
+# and a long TTL.
+#
+# Date and per-date file listings can change as new shots are recorded. We
+# use a short TTL for "today" and a longer TTL for past dates (which never
+# get new shots appended).
+_SHOT_DATA_CACHE_TTL = 60 * 60          # 1h — individual shot files are immutable
+_SHOT_DATA_CACHE_MAX = 256              # bounded size to cap memory
+_HISTORY_DATES_CACHE_TTL = 30           # seconds — dates list may gain today
+_SHOT_FILES_TODAY_TTL = 15              # seconds — today's list changes as shots fire
+_SHOT_FILES_PAST_TTL = 60 * 60          # 1h — past dates are immutable
+
+_shot_data_cache: "OrderedDict[tuple[str, str], tuple[float, dict]]" = OrderedDict()
+_history_dates_cache: Optional[tuple[float, Any]] = None
+_shot_files_cache: dict[str, tuple[float, Any]] = {}
 
 
 def _resolve_meticulous_base_url() -> str:
@@ -231,19 +252,74 @@ def decompress_shot_data(compressed_data: bytes) -> dict:
 
 @_wrap_machine_call
 async def fetch_shot_data(date_str: str, filename: str) -> dict:
-    """Fetch and decompress shot data from the Meticulous machine."""
+    """Fetch and decompress shot data from the Meticulous machine.
+
+    Results are cached by ``(date_str, filename)`` — individual shot files on
+    the machine are immutable once recorded, so the cache uses a bounded LRU
+    with a long TTL. Call :func:`invalidate_shot_history_cache` to force refresh.
+    """
+    key = (date_str, filename)
+    now = time.monotonic()
+
+    cached = _shot_data_cache.get(key)
+    if cached is not None:
+        cached_at, data = cached
+        if (now - cached_at) < _SHOT_DATA_CACHE_TTL:
+            # Mark as recently used (LRU)
+            _shot_data_cache.move_to_end(key)
+            return data
+        # Stale — drop and refetch.
+        del _shot_data_cache[key]
+
     api = get_meticulous_api()
     url = f"{api.base_url}/api/v1/history/files/{date_str}/{filename}"
-    
+
     client = _get_http_client()
     response = await client.get(url)
     response.raise_for_status()
-    
+
     # Check if it's compressed (zstd)
     if filename.endswith('.zst'):
-        return decompress_shot_data(response.content)
+        data = decompress_shot_data(response.content)
     else:
-        return response.json()
+        data = response.json()
+
+    _shot_data_cache[key] = (now, data)
+    _shot_data_cache.move_to_end(key)
+    # Evict oldest if over bound
+    while len(_shot_data_cache) > _SHOT_DATA_CACHE_MAX:
+        _shot_data_cache.popitem(last=False)
+
+    return data
+
+
+def invalidate_shot_history_cache(
+    date: Optional[str] = None,
+    filename: Optional[str] = None,
+) -> None:
+    """Invalidate the shot history caches.
+
+    - No args → clears everything (dates list, per-date file listings, shot data).
+    - ``date`` only → clears the file listing for that date plus all cached shots
+      from that date, and drops the dates list.
+    - ``date`` + ``filename`` → drops only that single cached shot and the file
+      listing for the date (in case the file list changed).
+    """
+    global _history_dates_cache
+    if date is None:
+        _history_dates_cache = None
+        _shot_files_cache.clear()
+        _shot_data_cache.clear()
+        return
+
+    _history_dates_cache = None
+    _shot_files_cache.pop(date, None)
+    if filename is None:
+        # Drop all cached shots for that date.
+        for key in [k for k in _shot_data_cache if k[0] == date]:
+            del _shot_data_cache[key]
+    else:
+        _shot_data_cache.pop((date, filename), None)
 
 
 # ============================================
@@ -588,18 +664,40 @@ async def async_session_post(path: str, json_body: dict = None):
 
 @_wrap_machine_call
 async def async_get_history_dates():
-    """get_history_dates() offloaded to a thread."""
+    """get_history_dates() offloaded to a thread, short-lived TTL cache."""
+    global _history_dates_cache
+    now = time.monotonic()
+    if _history_dates_cache is not None:
+        cached_at, data = _history_dates_cache
+        if (now - cached_at) < _HISTORY_DATES_CACHE_TTL:
+            return data
     api = get_meticulous_api()
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, api.get_history_dates)
+    result = await loop.run_in_executor(None, api.get_history_dates)
+    _history_dates_cache = (now, result)
+    return result
 
 
 @_wrap_machine_call
 async def async_get_shot_files(date: str):
-    """get_shot_files() offloaded to a thread."""
+    """get_shot_files() offloaded to a thread, per-date TTL cache.
+
+    Past dates are immutable (cached for :data:`_SHOT_FILES_PAST_TTL`); today's
+    entry uses a shorter TTL because new shots can be appended.
+    """
+    now = time.monotonic()
+    cached = _shot_files_cache.get(date)
+    today = time.strftime("%Y-%m-%d")
+    ttl = _SHOT_FILES_TODAY_TTL if date == today else _SHOT_FILES_PAST_TTL
+    if cached is not None:
+        cached_at, data = cached
+        if (now - cached_at) < ttl:
+            return data
     api = get_meticulous_api()
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, api.get_shot_files, date)
+    result = await loop.run_in_executor(None, api.get_shot_files, date)
+    _shot_files_cache[date] = (now, result)
+    return result
 
 
 @_wrap_machine_call
