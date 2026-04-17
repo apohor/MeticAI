@@ -5,7 +5,7 @@
  * Shows all temperatures, machine info, brightness/sounds controls,
  * and every available command button.
  */
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Button } from '@/components/ui/button'
 import { Slider } from '@/components/ui/slider'
@@ -65,9 +65,56 @@ interface ControlCenterExpandedProps {
 
 export function ControlCenterExpanded({ machineState, profileAuthor }: ControlCenterExpandedProps) {
   const { t } = useTranslation()
+  // Brightness slider uses an optimistic local value so dragging feels
+  // immediate. We seed it from machineState and resync whenever the
+  // machine-reported value changes, unless the user has just interacted
+  // (in which case we hold the optimistic value until the machine echoes
+  // it back or a short timeout expires).
   const [brightnessValue, setBrightnessValue] = useState<number>(
     machineState.brightness ?? 75,
   )
+  const brightnessPendingRef = useRef<number | null>(null)
+  const brightnessPendingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Sounds toggle — same optimistic pattern. The machine's socket.io
+  // status can take several seconds to echo setting changes, so relying
+  // purely on ``machineState.sounds_enabled`` makes the toggle look stuck.
+  const [soundsEnabled, setSoundsEnabled] = useState<boolean>(
+    machineState.sounds_enabled ?? false,
+  )
+  const soundsPendingRef = useRef<boolean | null>(null)
+  const soundsPendingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Resync from machine state when no optimistic update is pending, or when
+  // the machine has caught up to the optimistic value.
+  useEffect(() => {
+    const m = machineState.brightness
+    if (m == null) return
+    const pending = brightnessPendingRef.current
+    if (pending === null || pending === m) {
+      if (pending === m && brightnessPendingTimerRef.current) {
+        clearTimeout(brightnessPendingTimerRef.current)
+        brightnessPendingTimerRef.current = null
+        brightnessPendingRef.current = null
+      }
+      setBrightnessValue(m)
+    }
+  }, [machineState.brightness])
+
+  useEffect(() => {
+    const m = machineState.sounds_enabled
+    if (m == null) return
+    const pending = soundsPendingRef.current
+    if (pending === null || pending === m) {
+      if (pending === m && soundsPendingTimerRef.current) {
+        clearTimeout(soundsPendingTimerRef.current)
+        soundsPendingTimerRef.current = null
+        soundsPendingRef.current = null
+      }
+      setSoundsEnabled(m)
+    }
+  }, [machineState.sounds_enabled])
+
   const [profileImgUrl, setProfileImgUrl] = useState<string | null>(null)
   const [profileImgError, setProfileImgError] = useState(false)
   const [machineProfiles, setMachineProfiles] = useState<{ id: string; name: string }[]>([])
@@ -129,13 +176,42 @@ export function ControlCenterExpanded({ machineState, profileAuthor }: ControlCe
     async (val: number[]) => {
       const v = val[0]
       setBrightnessValue(v)
-      await machine.setBrightness(v)
+      brightnessPendingRef.current = v
+      if (brightnessPendingTimerRef.current) clearTimeout(brightnessPendingTimerRef.current)
+      // Safety timeout — if the machine never echoes the new value, fall
+      // back to whatever the WS says so the slider isn't wedged forever.
+      brightnessPendingTimerRef.current = setTimeout(() => {
+        brightnessPendingRef.current = null
+        brightnessPendingTimerRef.current = null
+        if (machineState.brightness != null) setBrightnessValue(machineState.brightness)
+      }, 10_000)
+      const res = await machine.setBrightness(v)
+      if (!res.success) {
+        // Revert on failure.
+        brightnessPendingRef.current = null
+        if (brightnessPendingTimerRef.current) {
+          clearTimeout(brightnessPendingTimerRef.current)
+          brightnessPendingTimerRef.current = null
+        }
+        if (machineState.brightness != null) setBrightnessValue(machineState.brightness)
+        toast.error(res.message ?? t('controlCenter.toasts.error'))
+      }
     },
-    [machine],
+    [machine, machineState.brightness, t],
   )
 
   const handleSoundsToggle = useCallback(
     async (enabled: boolean) => {
+      // Optimistic UI — flip immediately so the user gets feedback.
+      setSoundsEnabled(enabled)
+      soundsPendingRef.current = enabled
+      if (soundsPendingTimerRef.current) clearTimeout(soundsPendingTimerRef.current)
+      soundsPendingTimerRef.current = setTimeout(() => {
+        soundsPendingRef.current = null
+        soundsPendingTimerRef.current = null
+        if (machineState.sounds_enabled != null) setSoundsEnabled(machineState.sounds_enabled)
+      }, 10_000)
+
       const res = await machine.enableSounds(enabled)
       if (res.success) {
         toast.success(
@@ -144,10 +220,17 @@ export function ControlCenterExpanded({ machineState, profileAuthor }: ControlCe
             : t('controlCenter.toasts.soundsOff'),
         )
       } else {
+        // Revert the optimistic flip on failure.
+        soundsPendingRef.current = null
+        if (soundsPendingTimerRef.current) {
+          clearTimeout(soundsPendingTimerRef.current)
+          soundsPendingTimerRef.current = null
+        }
+        if (machineState.sounds_enabled != null) setSoundsEnabled(machineState.sounds_enabled)
         toast.error(res.message ?? t('controlCenter.toasts.error'))
       }
     },
-    [t, machine],
+    [t, machine, machineState.sounds_enabled],
   )
 
   return (
@@ -276,7 +359,7 @@ export function ControlCenterExpanded({ machineState, profileAuthor }: ControlCe
           {/* Sounds toggle */}
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
-              {machineState.sounds_enabled ? (
+              {soundsEnabled ? (
                 <SpeakerHigh size={16} className="text-muted-foreground" weight="duotone" />
               ) : (
                 <SpeakerSlash size={16} className="text-muted-foreground" weight="duotone" />
@@ -284,7 +367,7 @@ export function ControlCenterExpanded({ machineState, profileAuthor }: ControlCe
               <span className="text-sm text-foreground">{t('controlCenter.labels.sounds')}</span>
             </div>
             <Switch
-              checked={machineState.sounds_enabled ?? false}
+              checked={soundsEnabled}
               onCheckedChange={handleSoundsToggle}
               disabled={!isConnected}
             />
