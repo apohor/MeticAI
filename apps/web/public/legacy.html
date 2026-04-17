@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="light dark">
+    <title>MeticAI — Live status</title>
+    <style>
+        /* Intentionally kept to CSS that works back to Safari 11.
+           No CSS custom properties, color-mix, nesting, or @property. */
+        html, body {
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                          Helvetica, Arial, sans-serif;
+            background: #1a1a1a;
+            color: #eaeaea;
+            -webkit-text-size-adjust: 100%;
+        }
+        body { padding: 16px; }
+        h1 {
+            font-size: 18px;
+            font-weight: 600;
+            margin: 0 0 4px 0;
+        }
+        .sub {
+            color: #9a9a9a;
+            font-size: 12px;
+            margin-bottom: 16px;
+        }
+        .card {
+            background: #262626;
+            border: 1px solid #3a3a3a;
+            border-radius: 10px;
+            padding: 12px 14px;
+            margin-bottom: 10px;
+        }
+        .row {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            padding: 6px 0;
+            border-bottom: 1px solid #333;
+            font-size: 14px;
+        }
+        .row:last-child { border-bottom: 0; }
+        .row .label { color: #9a9a9a; }
+        .row .value {
+            font-variant-numeric: tabular-nums;
+            font-weight: 500;
+        }
+        .pill {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        .pill.on  { background: #1f3f25; color: #8ae29a; }
+        .pill.off { background: #3f1f1f; color: #e28a8a; }
+        .pill.warn { background: #3f341f; color: #e2c48a; }
+        .footer {
+            color: #6a6a6a;
+            font-size: 11px;
+            text-align: center;
+            margin-top: 16px;
+        }
+        a { color: #6aa6ff; }
+    </style>
+</head>
+<body>
+    <h1>MeticAI</h1>
+    <div class="sub" id="sub">Live machine status — polling…</div>
+
+    <div class="card">
+        <div class="row">
+            <span class="label">Connection</span>
+            <span class="value" id="v-connected"><span class="pill warn">…</span></span>
+        </div>
+        <div class="row">
+            <span class="label">State</span>
+            <span class="value" id="v-state">—</span>
+        </div>
+        <div class="row">
+            <span class="label">Active profile</span>
+            <span class="value" id="v-profile">—</span>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="row">
+            <span class="label">Brew head</span>
+            <span class="value" id="v-brew">—</span>
+        </div>
+        <div class="row">
+            <span class="label">Boiler</span>
+            <span class="value" id="v-boiler">—</span>
+        </div>
+        <div class="row">
+            <span class="label">Target</span>
+            <span class="value" id="v-target">—</span>
+        </div>
+        <div class="row">
+            <span class="label">Pressure</span>
+            <span class="value" id="v-pressure">—</span>
+        </div>
+        <div class="row">
+            <span class="label">Flow</span>
+            <span class="value" id="v-flow">—</span>
+        </div>
+        <div class="row">
+            <span class="label">Weight</span>
+            <span class="value" id="v-weight">—</span>
+        </div>
+        <div class="row">
+            <span class="label">Shot timer</span>
+            <span class="value" id="v-timer">—</span>
+        </div>
+    </div>
+
+    <div class="footer">
+        Safari-15-compatible read-only view. For full controls open the app
+        on a device with Safari 16.4 or newer.
+    </div>
+
+    <script>
+    (function () {
+        var FMT_NUM = function (v, suffix, digits) {
+            if (v === null || v === undefined || v === '' ) return '—';
+            var n = Number(v);
+            if (isNaN(n)) return String(v);
+            return n.toFixed(digits != null ? digits : 1) + (suffix || '');
+        };
+        var setText = function (id, text) {
+            var el = document.getElementById(id);
+            if (el) el.textContent = text;
+        };
+        var setHTML = function (id, html) {
+            var el = document.getElementById(id);
+            if (el) el.innerHTML = html;
+        };
+        var lastOk = 0;
+
+        function tick() {
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', '/api/live/snapshot', true);
+            xhr.timeout = 5000;
+            xhr.onreadystatechange = function () {
+                if (xhr.readyState !== 4) return;
+                if (xhr.status !== 200) {
+                    setHTML('v-connected', '<span class="pill off">offline</span>');
+                    return;
+                }
+                try {
+                    var d = JSON.parse(xhr.responseText) || {};
+                    var connected = d.connected === true ||
+                                    d.connected === 'true' ||
+                                    (d.availability && d.availability !== 'offline');
+                    setHTML('v-connected', connected
+                        ? '<span class="pill on">online</span>'
+                        : '<span class="pill off">offline</span>');
+                    setText('v-state', d.state || '—');
+                    setText('v-profile', d.active_profile || '—');
+                    setText('v-brew',     FMT_NUM(d.brew_head_temperature, ' °C'));
+                    setText('v-boiler',   FMT_NUM(d.boiler_temperature,    ' °C'));
+                    setText('v-target',   FMT_NUM(d.target_temperature,    ' °C'));
+                    setText('v-pressure', FMT_NUM(d.pressure, ' bar', 1));
+                    setText('v-flow',     FMT_NUM(d.flow_rate, ' g/s', 1));
+                    setText('v-weight',   FMT_NUM(d.shot_weight, ' g', 1));
+                    setText('v-timer',    FMT_NUM(d.shot_timer, ' s', 1));
+                    lastOk = Date.now();
+                    var sub = document.getElementById('sub');
+                    if (sub) sub.textContent = 'Live machine status — updated ' +
+                        new Date(lastOk).toLocaleTimeString();
+                } catch (e) {
+                    setHTML('v-connected', '<span class="pill off">error</span>');
+                }
+            };
+            xhr.ontimeout = function () {
+                setHTML('v-connected', '<span class="pill off">timeout</span>');
+            };
+            xhr.send();
+        }
+
+        tick();
+        setInterval(tick, 1000);
+    }());
+    </script>
+</body>
+</html>

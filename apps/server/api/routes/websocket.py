@@ -24,6 +24,21 @@ FRAME_INTERVAL = 0.1  # seconds
 TEST_MODE = os.environ.get("TEST_MODE") == "true"
 
 
+@router.get("/api/live/snapshot")
+async def live_snapshot():
+    """Return the latest MQTT snapshot as JSON.
+
+    Plain-HTTP alternative to ``/api/ws/live`` for clients that can't
+    use the WebSocket (legacy browsers, scripts). Same data source as
+    the WS stream; poll at whatever rate is appropriate.
+    """
+    subscriber = get_mqtt_subscriber()
+    snapshot = subscriber.get_snapshot() or {}
+    snapshot = dict(snapshot)
+    snapshot["_ts"] = time.time()
+    return snapshot
+
+
 @router.websocket("/api/ws/live")
 async def live_telemetry(ws: WebSocket):
     """Stream live machine telemetry over WebSocket.
