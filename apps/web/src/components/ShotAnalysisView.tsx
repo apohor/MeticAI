@@ -110,14 +110,66 @@ export function ShotAnalysisView({ onBack, onSelectShot }: ShotAnalysisViewProps
       setIsLoading(true)
     }
     setError(null)
+
+    // Incremental NDJSON stream: render shots as they arrive so the list
+    // populates immediately from the on-disk index, then grows as the
+    // server finishes fetching any uncached ones.
     try {
       const serverUrl = await getServerUrl()
-      const response = await fetch(`${serverUrl}/api/shots/recent?limit=50&offset=0`)
-      if (!response.ok) throw new Error(t('shotAnalysis.fetchFailed'))
-      const data = await response.json()
-      const shots = data.shots || []
-      shotAnalysisCache.recent = { shots, fetchedAt: Date.now() }
-      setRecentShots(shots)
+      const response = await fetch(`${serverUrl}/api/shots/recent/stream?limit=50`)
+      if (!response.ok || !response.body) {
+        throw new Error(t('shotAnalysis.fetchFailed'))
+      }
+
+      const collected: RecentShot[] = []
+      const seen = new Set<string>()
+      // We replace the visible list only when we've received at least one
+      // item, to avoid briefly showing an empty state if cache had data.
+      let firstBatchApplied = !cached
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buf = ''
+
+      const sortByTs = (arr: RecentShot[]) =>
+        [...arr].sort((a, b) => {
+          const ax = typeof a.timestamp === 'string' ? parseFloat(a.timestamp) : (a.timestamp ?? 0)
+          const bx = typeof b.timestamp === 'string' ? parseFloat(b.timestamp) : (b.timestamp ?? 0)
+          return (bx || 0) - (ax || 0)
+        })
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        const lines = buf.split('\n')
+        buf = lines.pop() ?? ''
+        for (const line of lines) {
+          if (!line.trim()) continue
+          try {
+            const parsed = JSON.parse(line) as RecentShot | { error: string }
+            if ('error' in parsed) {
+              throw new Error(parsed.error)
+            }
+            const key = `${parsed.date}|${parsed.filename}`
+            if (seen.has(key)) continue
+            seen.add(key)
+            collected.push(parsed)
+          } catch {
+            // Skip malformed line
+          }
+        }
+        // Update UI in small batches so React doesn't thrash on every line
+        const sorted = sortByTs(collected)
+        if (!firstBatchApplied) {
+          setRecentShots(sorted)
+          setIsLoading(false)
+          firstBatchApplied = true
+        } else {
+          setRecentShots(sorted)
+        }
+      }
+
+      shotAnalysisCache.recent = { shots: sortByTs(collected), fetchedAt: Date.now() }
     } catch (err) {
       // Only set error if we have no cached data to show
       if (!shotAnalysisCache.recent) {
@@ -175,6 +227,38 @@ export function ShotAnalysisView({ onBack, onSelectShot }: ShotAnalysisViewProps
       fetchByProfile()
     }
   }, [activeTab, fetchRecentShots, fetchByProfile])
+
+  // Prefetch the top few shots' full telemetry in the background so clicking
+  // one is instant.  The backend LRU makes these no-ops on subsequent loads.
+  useEffect(() => {
+    const PREFETCH_COUNT = 5
+    const targets: RecentShot[] =
+      activeTab === 'recent'
+        ? recentShots.slice(0, PREFETCH_COUNT)
+        : profileGroups.flatMap(g => g.shots).slice(0, PREFETCH_COUNT)
+    if (targets.length === 0) return
+
+    const controller = new AbortController()
+    ;(async () => {
+      try {
+        const serverUrl = await getServerUrl()
+        // Stagger slightly so the initial render isn't competing for bandwidth.
+        await new Promise(r => setTimeout(r, 100))
+        await Promise.all(
+          targets.map(shot =>
+            fetch(
+              `${serverUrl}/api/shots/data/${shot.date}/${encodeURIComponent(shot.filename)}`,
+              { signal: controller.signal },
+            ).catch(() => null),
+          ),
+        )
+      } catch {
+        // Silent — prefetch is best-effort.
+      }
+    })()
+
+    return () => controller.abort()
+  }, [activeTab, recentShots, profileGroups])
 
   const handleRefresh = () => {
     if (activeTab === 'recent') {

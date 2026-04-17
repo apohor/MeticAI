@@ -290,7 +290,33 @@ async def fetch_shot_data(date_str: str, filename: str) -> dict:
     while len(_shot_data_cache) > _SHOT_DATA_CACHE_MAX:
         _shot_data_cache.popitem(last=False)
 
+    # Persist extracted metadata so future listings avoid refetching this
+    # shot.  Fire-and-forget — best effort, never blocks the caller.
+    try:
+        from services import shot_metadata_index
+
+        metadata = shot_metadata_index.extract_metadata(date_str, filename, data)
+        asyncio.create_task(shot_metadata_index.put(date_str, filename, metadata))
+    except Exception as e:  # pragma: no cover — index is a cache, never fatal
+        logger.debug(f"Could not index shot metadata for {date_str}/{filename}: {e}")
+
     return data
+
+
+async def fetch_shot_metadata(date_str: str, filename: str) -> dict:
+    """Return lightweight listing metadata for a shot.
+
+    Checks the persistent on-disk index first so repeat listings don't need
+    to re-fetch + re-decompress the full telemetry payload. Falls back to a
+    full :func:`fetch_shot_data` call (which itself populates the index).
+    """
+    from services import shot_metadata_index
+
+    cached = shot_metadata_index.get(date_str, filename)
+    if cached is not None:
+        return cached
+    shot_data = await fetch_shot_data(date_str, filename)
+    return shot_metadata_index.extract_metadata(date_str, filename, shot_data)
 
 
 def invalidate_shot_history_cache(
@@ -306,6 +332,14 @@ def invalidate_shot_history_cache(
       listing for the date (in case the file list changed).
     """
     global _history_dates_cache
+    # Keep the persistent on-disk metadata index aligned with in-memory caches.
+    try:
+        from services import shot_metadata_index
+
+        asyncio.create_task(shot_metadata_index.invalidate(date, filename))
+    except Exception:  # pragma: no cover
+        pass
+
     if date is None:
         _history_dates_cache = None
         _shot_files_cache.clear()

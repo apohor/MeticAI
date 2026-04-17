@@ -190,6 +190,41 @@ export function ShotDetail({
     compReplay.setCurrentTime(0)
   }, [comparisonShot]) // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ---- Prefetch nearby shots for instant comparison -----------------------
+  // The backend LRU caches full shot telemetry, so a warm fetch here means
+  // the next "Compare with…" pick lands in <100 ms instead of hundreds.
+  useEffect(() => {
+    if (!selectedShot) return
+    const PREFETCH_RADIUS = 3
+    const idx = shots.findIndex(
+      s => s.date === selectedShot.date && s.filename === selectedShot.filename,
+    )
+    if (idx < 0) return
+    const neighbours = shots
+      .slice(Math.max(0, idx - PREFETCH_RADIUS), idx + PREFETCH_RADIUS + 1)
+      .filter(s => !(s.date === selectedShot.date && s.filename === selectedShot.filename))
+    if (neighbours.length === 0) return
+
+    const controller = new AbortController()
+    ;(async () => {
+      try {
+        const serverUrl = await getServerUrl()
+        await new Promise(r => setTimeout(r, 150))
+        await Promise.all(
+          neighbours.map(n =>
+            fetch(
+              `${serverUrl}/api/shots/data/${n.date}/${encodeURIComponent(n.filename)}`,
+              { signal: controller.signal },
+            ).catch(() => null),
+          ),
+        )
+      } catch {
+        // best-effort
+      }
+    })()
+    return () => controller.abort()
+  }, [selectedShot, shots])
+
   // ---- LLM cache check on shot change -------------------------------------
   useEffect(() => {
     if (!selectedShot) {

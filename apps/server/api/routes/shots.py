@@ -10,11 +10,12 @@ import httpx
 import requests
 
 from services.meticulous_service import (
-    fetch_shot_data,
+    fetch_shot_data, fetch_shot_metadata,
     async_list_profiles, async_get_history_dates,
     async_get_shot_files, async_get_profile,
     MachineUnreachableError,
 )
+from services import shot_metadata_index
 from services.cache_service import (
     get_cached_llm_analysis, save_llm_analysis_to_cache,
     _get_cached_shots, _set_cached_shots
@@ -339,13 +340,29 @@ async def get_shots_by_profile(
         
         dates = [d.name for d in dates_result] if dates_result else []
         matching_shots = []
-        
-        # Concurrency limiter — avoid overwhelming the machine with requests
-        sem = asyncio.Semaphore(6)
-        
+
+        # Concurrency limiter — avoid overwhelming the machine with requests.
+        # The on-disk metadata index serves most calls with no HTTP at all,
+        # so we can allow more parallelism on the cold-path fetches.
+        sem = asyncio.Semaphore(16)
+
         async def _fetch_and_match(date: str, filename: str):
-            """Fetch a single shot and return info dict if it matches, else None."""
+            """Fetch shot metadata and return info dict if profile matches."""
             async with sem:
+                # Fast path: on-disk index hit.
+                cached = shot_metadata_index.get(date, filename)
+                if cached is not None and not include_data:
+                    if cached.get("profile_name", "").lower() != profile_name.lower():
+                        return None
+                    return {
+                        "date": date,
+                        "filename": filename,
+                        "timestamp": cached.get("timestamp"),
+                        "profile_name": cached.get("profile_name", ""),
+                        "final_weight": cached.get("final_weight"),
+                        "total_time": cached.get("total_time"),
+                    }
+
                 try:
                     shot_data = await fetch_shot_data(date, filename)
                 except Exception as e:
@@ -1046,43 +1063,27 @@ async def get_recent_shots(request: Request, limit: int = 50, offset: int = 0):
         dates = sorted([d.name for d in dates_result], reverse=True) if dates_result else []
 
         all_shots: list[dict] = []
-        sem = asyncio.Semaphore(6)
+        # Semaphore bounds concurrent full-fetches to the machine. Most calls
+        # are served from the on-disk metadata index (no HTTP), so we can be
+        # more aggressive about the cold-path fetches.
+        sem = asyncio.Semaphore(16)
 
         async def _fetch_shot_info(date: str, filename: str):
             async with sem:
                 try:
-                    shot_data = await fetch_shot_data(date, filename)
+                    meta = await fetch_shot_metadata(date, filename)
                 except Exception:
                     return None
 
-                profile_name = shot_data.get("profile_name", "")
-                if not profile_name and isinstance(shot_data.get("profile"), dict):
-                    profile_name = shot_data["profile"].get("name", "")
-
-                profile_id = ""
-                if isinstance(shot_data.get("profile"), dict):
-                    profile_id = shot_data["profile"].get("id", "")
-
-                data_entries = shot_data.get("data", [])
-                final_weight = None
-                total_time_ms = None
-                if data_entries:
-                    last_entry = data_entries[-1]
-                    if isinstance(last_entry.get("shot"), dict):
-                        final_weight = last_entry["shot"].get("weight")
-                    total_time_ms = last_entry.get("time")
-
-                timestamp = shot_data.get("time")
                 annotation = get_annotation(date, filename)
-
                 return {
-                    "profile_name": profile_name,
-                    "profile_id": profile_id,
+                    "profile_name": meta.get("profile_name", ""),
+                    "profile_id": meta.get("profile_id", ""),
                     "date": date,
                     "filename": filename,
-                    "timestamp": timestamp,
-                    "final_weight": final_weight,
-                    "total_time": total_time_ms / 1000 if total_time_ms else None,
+                    "timestamp": meta.get("timestamp"),
+                    "final_weight": meta.get("final_weight"),
+                    "total_time": meta.get("total_time"),
                     "has_annotation": annotation is not None,
                 }
 
@@ -1178,6 +1179,140 @@ async def get_recent_shots_by_profile(request: Request, limit: int = 50, offset:
             extra={"request_id": request_id, "error_type": type(e).__name__},
         )
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Lightweight metadata endpoints
+# ============================================================================
+
+
+@router.get("/api/shots/metadata/{date}/{filename:path}")
+async def get_shot_metadata(request: Request, date: str, filename: str):
+    """Return listing-only metadata for a single shot.
+
+    Much cheaper than :func:`get_shot_data` — avoids zstd decompression and
+    telemetry decoding once the shot has been indexed on disk.
+    """
+    if not re.match(r'^\d{4}-\d{2}-\d{2}$', date):
+        raise HTTPException(status_code=400, detail="Invalid date format. Expected YYYY-MM-DD.")
+    if '..' in filename or filename.startswith('/'):
+        raise HTTPException(status_code=400, detail="Invalid filename.")
+
+    from services.meticulous_service import fetch_shot_metadata as _fetch_meta
+
+    try:
+        meta = await _fetch_meta(date, filename)
+        return {"date": date, "filename": filename, **meta}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Failed to fetch shot metadata: {e}",
+            exc_info=True,
+            extra={"request_id": request.state.request_id, "date": date, "shot_file": filename},
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/shots/recent/stream")
+@router.get("/api/shots/recent/stream")
+async def stream_recent_shots(request: Request, limit: int = 50):
+    """Stream recent shots as NDJSON so the UI can render them incrementally.
+
+    Emits indexed shots first (instant, from disk) then any newly-fetched
+    shots one-by-one as they come back from the machine. Each line is a
+    single JSON object; the client can parse and render each line as it
+    arrives without waiting for the whole response.
+    """
+    from fastapi.responses import StreamingResponse
+    from services.shot_annotations_service import get_annotation
+    from services.meticulous_service import fetch_shot_metadata as _fetch_meta
+
+    limit = max(1, min(limit, 100))
+
+    async def _iter():
+        try:
+            dates_result = await async_get_history_dates()
+            if hasattr(dates_result, "error") and dates_result.error:
+                yield json.dumps({"error": dates_result.error}) + "\n"
+                return
+
+            dates = sorted([d.name for d in dates_result], reverse=True) if dates_result else []
+
+            # Build ordered list of (date, filename) newest-first.
+            pending: list[tuple[str, str]] = []
+            for date in dates:
+                if len(pending) >= limit:
+                    break
+                files_result = await async_get_shot_files(date)
+                if hasattr(files_result, "error") and files_result.error:
+                    continue
+                files = sorted([f.name for f in files_result], reverse=True) if files_result else []
+                for fn in files:
+                    pending.append((date, fn))
+                    if len(pending) >= limit:
+                        break
+
+            def _shape(date: str, filename: str, meta: dict) -> dict:
+                annotation = get_annotation(date, filename)
+                return {
+                    "profile_name": meta.get("profile_name", ""),
+                    "profile_id": meta.get("profile_id", ""),
+                    "date": date,
+                    "filename": filename,
+                    "timestamp": meta.get("timestamp"),
+                    "final_weight": meta.get("final_weight"),
+                    "total_time": meta.get("total_time"),
+                    "has_annotation": annotation is not None,
+                }
+
+            # First pass — drain anything already in the index (instant).
+            uncached: list[tuple[str, str]] = []
+            for date, filename in pending:
+                cached = shot_metadata_index.get(date, filename)
+                if cached is not None:
+                    yield json.dumps(_shape(date, filename, cached)) + "\n"
+                else:
+                    uncached.append((date, filename))
+
+            if not uncached:
+                return
+
+            # Second pass — fetch the stragglers concurrently; emit each as
+            # it resolves.  ``asyncio.as_completed`` streams results in
+            # completion order, not submission order, which is fine — the
+            # client sorts by timestamp after receiving them.
+            sem = asyncio.Semaphore(16)
+
+            async def _fetch_one(date: str, filename: str):
+                async with sem:
+                    try:
+                        meta = await _fetch_meta(date, filename)
+                        return (date, filename, meta)
+                    except Exception as e:
+                        logger.debug(f"stream: skip {date}/{filename}: {e}")
+                        return None
+
+            tasks = [asyncio.create_task(_fetch_one(d, f)) for d, f in uncached]
+            try:
+                for coro in asyncio.as_completed(tasks):
+                    res = await coro
+                    if res is None:
+                        continue
+                    date, filename, meta = res
+                    yield json.dumps(_shape(date, filename, meta)) + "\n"
+            finally:
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+
+        except HTTPException as e:
+            yield json.dumps({"error": str(e.detail)}) + "\n"
+        except Exception as e:
+            logger.error(f"stream_recent_shots failed: {e}", exc_info=True)
+            yield json.dumps({"error": str(e)}) + "\n"
+
+    return StreamingResponse(_iter(), media_type="application/x-ndjson")
 
 
 # ============================================================================
