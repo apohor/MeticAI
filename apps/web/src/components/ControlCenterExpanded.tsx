@@ -85,34 +85,26 @@ export function ControlCenterExpanded({ machineState, profileAuthor }: ControlCe
   const soundsPendingRef = useRef<boolean | null>(null)
   const soundsPendingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  // Resync from machine state when no optimistic update is pending, or when
-  // the machine has caught up to the optimistic value.
+  // Resync from machine state, but while an optimistic write is pending
+  // ignore contradicting echoes. The bridge's ``update_settings()`` can
+  // republish stale cached state a moment after the change is applied,
+  // which would otherwise flip the UI back to the old value. We hold the
+  // pending lock until the safety timeout clears it, accepting only echoes
+  // that match the user's intent.
   useEffect(() => {
     const m = machineState.brightness
     if (m == null) return
     const pending = brightnessPendingRef.current
-    if (pending === null || pending === m) {
-      if (pending === m && brightnessPendingTimerRef.current) {
-        clearTimeout(brightnessPendingTimerRef.current)
-        brightnessPendingTimerRef.current = null
-        brightnessPendingRef.current = null
-      }
-      setBrightnessValue(m)
-    }
+    if (pending !== null && pending !== m) return
+    setBrightnessValue(m)
   }, [machineState.brightness])
 
   useEffect(() => {
     const m = machineState.sounds_enabled
     if (m == null) return
     const pending = soundsPendingRef.current
-    if (pending === null || pending === m) {
-      if (pending === m && soundsPendingTimerRef.current) {
-        clearTimeout(soundsPendingTimerRef.current)
-        soundsPendingTimerRef.current = null
-        soundsPendingRef.current = null
-      }
-      setSoundsEnabled(m)
-    }
+    if (pending !== null && pending !== m) return
+    setSoundsEnabled(m)
   }, [machineState.sounds_enabled])
 
   const [profileImgUrl, setProfileImgUrl] = useState<string | null>(null)
@@ -184,7 +176,7 @@ export function ControlCenterExpanded({ machineState, profileAuthor }: ControlCe
         brightnessPendingRef.current = null
         brightnessPendingTimerRef.current = null
         if (machineState.brightness != null) setBrightnessValue(machineState.brightness)
-      }, 10_000)
+      }, 4_000)
       const res = await machine.setBrightness(v)
       if (!res.success) {
         // Revert on failure.
@@ -210,7 +202,7 @@ export function ControlCenterExpanded({ machineState, profileAuthor }: ControlCe
         soundsPendingRef.current = null
         soundsPendingTimerRef.current = null
         if (machineState.sounds_enabled != null) setSoundsEnabled(machineState.sounds_enabled)
-      }, 10_000)
+      }, 8_000)
 
       const res = await machine.enableSounds(enabled)
       if (res.success) {
