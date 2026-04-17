@@ -171,6 +171,12 @@ async def lifespan(app: FastAPI):
     # Load recurring schedules and schedule next occurrences
     logger.info("Loading recurring schedules from persistence")
     await _load_recurring_schedules()
+
+    # Pre-fetch the machine's configured timezone so recurring schedules
+    # without an explicit ``timezone`` use the machine's local time, not UTC.
+    from services.scheduling_state import refresh_machine_timezone
+    await refresh_machine_timezone()
+
     for schedule_id, schedule in _recurring_schedules.items():
         if schedule.get("enabled", True):
             await _schedule_next_recurring(schedule_id, schedule)

@@ -35,6 +35,105 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+async def _execute_scheduled_shot(
+    schedule_id: str,
+    profile_id: str | None,
+    shot_delay: float,
+    preheat: bool,
+):
+    """Background execution for a scheduled shot.
+
+    Sleeps until scheduled time (triggering preheat 10 min before if enabled),
+    then loads and starts the profile. Shared by one-off `schedule_shot` and
+    recurring `_schedule_next_recurring`.
+    """
+    try:
+        task_start_time = datetime.now(timezone.utc)
+        full_delay_waited = False
+
+        if preheat:
+            preheat_delay = shot_delay - (PREHEAT_DURATION_MINUTES * 60)
+            if preheat_delay > 0:
+                await asyncio.sleep(preheat_delay)
+                async with _get_state_lock():
+                    _scheduled_shots[schedule_id]["status"] = "preheating"
+                await _save_scheduled_shots()
+
+                try:
+                    from meticulous.api_types import ActionType as AT
+                    await async_execute_action(AT.PREHEAT)
+                except Exception as e:
+                    logger.warning(f"Preheat failed for scheduled shot {schedule_id}: {e}")
+
+                await asyncio.sleep(PREHEAT_DURATION_MINUTES * 60)
+                full_delay_waited = True
+            else:
+                async with _get_state_lock():
+                    _scheduled_shots[schedule_id]["status"] = "preheating"
+                await _save_scheduled_shots()
+                try:
+                    from meticulous.api_types import ActionType as AT
+                    await async_execute_action(AT.PREHEAT)
+                except Exception as e:
+                    logger.warning(f"Preheat failed for scheduled shot {schedule_id}: {e}")
+
+        if not full_delay_waited:
+            elapsed = (datetime.now(timezone.utc) - task_start_time).total_seconds()
+            remaining_delay = max(0, shot_delay - elapsed)
+            await asyncio.sleep(remaining_delay)
+
+        async with _get_state_lock():
+            _scheduled_shots[schedule_id]["status"] = "running"
+        await _save_scheduled_shots()
+
+        if profile_id:
+            load_result = await async_load_profile_by_id(profile_id)
+            if not (hasattr(load_result, 'error') and load_result.error):
+                from meticulous.api_types import ActionType
+                await async_execute_action(ActionType.START)
+                async with _get_state_lock():
+                    _scheduled_shots[schedule_id]["status"] = "completed"
+                await _save_scheduled_shots()
+            else:
+                async with _get_state_lock():
+                    _scheduled_shots[schedule_id]["status"] = "failed"
+                    _scheduled_shots[schedule_id]["error"] = load_result.error
+                await _save_scheduled_shots()
+        else:
+            async with _get_state_lock():
+                _scheduled_shots[schedule_id]["status"] = "completed"
+            await _save_scheduled_shots()
+
+    except asyncio.CancelledError:
+        async with _get_state_lock():
+            _scheduled_shots[schedule_id]["status"] = "cancelled"
+        await _save_scheduled_shots()
+    except Exception as e:
+        logger.error(f"Scheduled shot {schedule_id} failed: {e}")
+        async with _get_state_lock():
+            _scheduled_shots[schedule_id]["status"] = "failed"
+            _scheduled_shots[schedule_id]["error"] = str(e)
+        await _save_scheduled_shots()
+    finally:
+        async with _get_state_lock():
+            if schedule_id in _scheduled_tasks:
+                del _scheduled_tasks[schedule_id]
+
+
+def _spawn_shot_task(
+    schedule_id: str,
+    profile_id: str | None,
+    shot_delay: float,
+    preheat: bool,
+) -> asyncio.Task:
+    """Create and register the background execution task for a scheduled shot."""
+    task = asyncio.create_task(
+        _execute_scheduled_shot(schedule_id, profile_id, shot_delay, preheat)
+    )
+    _scheduled_tasks[schedule_id] = task
+    return task
+
+
 async def _schedule_next_recurring(schedule_id: str, schedule: dict):
     """Schedule the next occurrence of a recurring schedule."""
     next_occurrence = _get_next_occurrence(schedule)
@@ -55,7 +154,7 @@ async def _schedule_next_recurring(schedule_id: str, schedule: dict):
     
     # Get schedule details
     profile_id = schedule.get("profile_id")
-    preheat = schedule.get("preheat", True)
+    preheat = schedule.get("preheat", False)
     
     # Add to scheduled shots (lock protects dict mutation)
     async with _get_state_lock():
@@ -68,7 +167,9 @@ async def _schedule_next_recurring(schedule_id: str, schedule: dict):
             "recurring_schedule_id": schedule_id,
             "created_at": now.isoformat()
         }
-    
+        # Spawn the background execution task so the shot (and preheat) actually fires.
+        _spawn_shot_task(shot_id, profile_id, delay_seconds, preheat)
+
     await _save_scheduled_shots()
     
     logger.info(
@@ -522,94 +623,9 @@ async def schedule_shot(request: Request):
             }
         )
         
-        # Create async task to execute at scheduled time
-        async def _execute_shot_task():
-            try:
-                task_start_time = datetime.now(timezone.utc)
-                
-                # Track whether we've already waited the full delay
-                full_delay_waited = False
-                
-                # If preheat is enabled, start it 10 minutes before
-                if preheat:
-                    preheat_delay = shot_delay - (PREHEAT_DURATION_MINUTES * 60)
-                    if preheat_delay > 0:
-                        await asyncio.sleep(preheat_delay)
-                        async with _get_state_lock():
-                            _scheduled_shots[schedule_id]["status"] = "preheating"
-                        await _save_scheduled_shots()
-                        
-                        # Start preheat using ActionType.PREHEAT
-                        try:
-                            from meticulous.api_types import ActionType as AT
-                            await async_execute_action(AT.PREHEAT)
-                        except Exception as e:
-                            logger.warning(f"Preheat failed for scheduled shot {schedule_id}: {e}")
-                        
-                        # Wait for remaining time until shot
-                        await asyncio.sleep(PREHEAT_DURATION_MINUTES * 60)
-                        full_delay_waited = True
-                    else:
-                        # Not enough time for full preheat, start immediately
-                        async with _get_state_lock():
-                            _scheduled_shots[schedule_id]["status"] = "preheating"
-                        await _save_scheduled_shots()
-                        try:
-                            from meticulous.api_types import ActionType as AT
-                            await async_execute_action(AT.PREHEAT)
-                        except Exception as e:
-                            logger.warning(f"Preheat failed for scheduled shot {schedule_id}: {e}")
-                
-                # If we haven't already waited the full delay, calculate remaining time
-                if not full_delay_waited:
-                    elapsed = (datetime.now(timezone.utc) - task_start_time).total_seconds()
-                    remaining_delay = max(0, shot_delay - elapsed)
-                    await asyncio.sleep(remaining_delay)
-                
-                async with _get_state_lock():
-                    _scheduled_shots[schedule_id]["status"] = "running"
-                await _save_scheduled_shots()
-                
-                # Load and run the profile (if profile_id was provided)
-                if profile_id:
-                    load_result = await async_load_profile_by_id(profile_id)
-                    if not (hasattr(load_result, 'error') and load_result.error):
-                        from meticulous.api_types import ActionType
-                        await async_execute_action(ActionType.START)
-                        async with _get_state_lock():
-                            _scheduled_shots[schedule_id]["status"] = "completed"
-                        await _save_scheduled_shots()
-                    else:
-                        async with _get_state_lock():
-                            _scheduled_shots[schedule_id]["status"] = "failed"
-                            _scheduled_shots[schedule_id]["error"] = load_result.error
-                        await _save_scheduled_shots()
-                else:
-                    # Preheat only mode - mark as completed
-                    async with _get_state_lock():
-                        _scheduled_shots[schedule_id]["status"] = "completed"
-                    await _save_scheduled_shots()
-                    
-            except asyncio.CancelledError:
-                async with _get_state_lock():
-                    _scheduled_shots[schedule_id]["status"] = "cancelled"
-                await _save_scheduled_shots()
-            except Exception as e:
-                logger.error(f"Scheduled shot {schedule_id} failed: {e}")
-                async with _get_state_lock():
-                    _scheduled_shots[schedule_id]["status"] = "failed"
-                    _scheduled_shots[schedule_id]["error"] = str(e)
-                await _save_scheduled_shots()
-            finally:
-                # Clean up task reference
-                async with _get_state_lock():
-                    if schedule_id in _scheduled_tasks:
-                        del _scheduled_tasks[schedule_id]
-        
-        # Start the background task
-        task = asyncio.create_task(_execute_shot_task())
+        # Start the background execution task (handles preheat + shot).
         async with _get_state_lock():
-            _scheduled_tasks[schedule_id] = task
+            _spawn_shot_task(schedule_id, profile_id, shot_delay, preheat)
         
         return {
             "status": "success",
@@ -803,18 +819,39 @@ async def create_recurring_schedule(request: Request):
                 raise HTTPException(status_code=400, detail="days_of_week cannot be empty for specific_days type")
         
         profile_id = body.get("profile_id")
-        preheat = body.get("preheat", True)
-        
+        preheat = body.get("preheat", False)
+
+        # Validate optional IANA timezone (e.g. "America/Los_Angeles").
+        # If omitted, scheduling will fall back to the machine's configured
+        # timezone (cached from /api/v1/settings), then to UTC.
+        tz_name = body.get("timezone")
+        if tz_name:
+            try:
+                from zoneinfo import ZoneInfo
+                ZoneInfo(tz_name)
+            except Exception:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid timezone '{tz_name}'. Use an IANA tz name (e.g. America/Los_Angeles) or 'UTC'.",
+                )
+
         if not profile_id and not preheat:
             raise HTTPException(status_code=400, detail="Either profile_id or preheat must be provided")
         
         # Generate unique ID
         schedule_id = str(uuid.uuid4())
-        
+
+        # Refresh the machine timezone cache so a fresh schedule uses the
+        # current machine tz even if the server hasn't polled lately.
+        from services.scheduling_state import refresh_machine_timezone
+        if not tz_name:
+            await refresh_machine_timezone()
+
         # Create schedule object
         schedule = {
             "name": body.get("name", f"Schedule {time_str}"),
             "time": time_str,
+            "timezone": tz_name,  # None => fall back to machine tz at calc time
             "recurrence_type": recurrence_type,
             "interval_days": body.get("interval_days", 1) if recurrence_type == "interval" else None,
             "days_of_week": body.get("days_of_week", []) if recurrence_type == "specific_days" else None,
@@ -880,6 +917,17 @@ async def update_recurring_schedule(schedule_id: str, request: Request):
                     schedule["time"] = time_str
                 except (ValueError, AttributeError):
                     raise HTTPException(status_code=400, detail="Invalid time format. Use HH:MM (24-hour)")
+            if "timezone" in body:
+                tz_name = body["timezone"] or "UTC"
+                try:
+                    from zoneinfo import ZoneInfo
+                    ZoneInfo(tz_name)
+                except Exception:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid timezone '{tz_name}'. Use an IANA tz name or 'UTC'.",
+                    )
+                schedule["timezone"] = tz_name
             if "recurrence_type" in body:
                 valid_types = ["daily", "weekdays", "weekends", "interval", "specific_days"]
                 if body["recurrence_type"] not in valid_types:
@@ -895,7 +943,14 @@ async def update_recurring_schedule(schedule_id: str, request: Request):
                 schedule["preheat"] = body["preheat"]
             if "enabled" in body:
                 schedule["enabled"] = body["enabled"]
-            
+
+            # Guard: schedule must still have profile or preheat after update.
+            if not schedule.get("profile_id") and not schedule.get("preheat"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Schedule must have either profile_id or preheat enabled",
+                )
+
             schedule["updated_at"] = datetime.now(timezone.utc).isoformat()
         
         await _save_recurring_schedules()

@@ -3281,7 +3281,7 @@ async def _schedule_next_recurring(schedule_id: str, schedule: dict):
         return
     
     profile_id = schedule.get("profile_id")
-    preheat = schedule.get("preheat", True)
+    preheat = schedule.get("preheat", False)
     
     # Create a one-time scheduled shot for the next occurrence
     shot_id = f"recurring-{schedule_id}-{next_time.isoformat()}"
@@ -3309,7 +3309,12 @@ async def _schedule_next_recurring(schedule_id: str, schedule: dict):
     }
     _scheduled_shots[shot_id] = scheduled_shot
     await _save_scheduled_shots()
-    
+
+    # Spawn the background execution task so the shot (and preheat) actually fires.
+    # Without this the shot just sits in _scheduled_shots forever.
+    from api.routes.scheduling import _spawn_shot_task
+    _spawn_shot_task(shot_id, profile_id, shot_delay, preheat)
+
     logger.info(
         f"Scheduled next recurring shot {shot_id} for {next_time.isoformat()} "
         f"(profile: {profile_id}, preheat: {preheat})"
@@ -3325,9 +3330,12 @@ async def _recurring_schedule_checker():
     """
     while True:
         try:
-            await asyncio.sleep(3600)  # Check every hour
-            
             logger.info("Running recurring schedule check")
+
+            # Keep the machine timezone cache fresh so new/updated schedules
+            # without an explicit timezone track the machine's local time.
+            from services.scheduling_state import refresh_machine_timezone
+            await refresh_machine_timezone()
             
             # Find completed recurring shots and schedule next occurrence
             for shot_id, shot in list(_scheduled_shots.items()):
@@ -3357,7 +3365,10 @@ async def _recurring_schedule_checker():
                 
                 if not has_pending:
                     await _schedule_next_recurring(schedule_id, schedule)
-                    
+
+            # Sleep between checks (after running, so first check runs immediately on startup).
+            await asyncio.sleep(3600)
+
         except asyncio.CancelledError:
             break
         except Exception as e:

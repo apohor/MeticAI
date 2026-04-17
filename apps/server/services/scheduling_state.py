@@ -7,6 +7,7 @@ This module is the single source of truth for:
 """
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import logging
 import json
 import asyncio
@@ -54,6 +55,58 @@ def _get_state_lock() -> asyncio.Lock:
 
 # Constant for preheat duration
 PREHEAT_DURATION_MINUTES = 10
+
+
+# ==============================================================================
+# Machine Timezone Cache
+# ==============================================================================
+# Meticulous machines expose ``time_zone`` (IANA, e.g. "America/New_York") via
+# ``GET /api/v1/settings``. We cache it so recurring schedules with no explicit
+# timezone fall back to the machine's local time rather than UTC.
+
+_machine_timezone_cache: Optional[str] = None
+
+
+async def refresh_machine_timezone() -> Optional[str]:
+    """Fetch and cache the machine's configured timezone.
+
+    Reads ``time_zone`` from the Meticulous machine's settings. On error,
+    the cache is left unchanged. Returns the cached value (new or existing)
+    or ``None`` if the machine has never been reachable.
+    """
+    global _machine_timezone_cache
+    try:
+        # Deferred import to avoid a circular dependency between
+        # scheduling_state -> meticulous_service -> settings_service.
+        from services.meticulous_service import async_get_settings
+
+        settings = await async_get_settings()
+        if settings is None:
+            return _machine_timezone_cache
+
+        # pyMeticulous returns either a Pydantic model or a dict-like value.
+        if hasattr(settings, "model_dump"):
+            data = settings.model_dump()
+        elif hasattr(settings, "__dict__"):
+            data = dict(vars(settings))
+        else:
+            try:
+                data = dict(settings)
+            except Exception:
+                data = {}
+
+        tz = data.get("time_zone") or data.get("timezone")
+        if isinstance(tz, str) and tz.strip():
+            _machine_timezone_cache = tz.strip()
+            logger.debug(f"Cached machine timezone: {_machine_timezone_cache}")
+    except Exception as e:
+        logger.debug(f"Could not refresh machine timezone: {e}")
+    return _machine_timezone_cache
+
+
+def get_cached_machine_timezone() -> Optional[str]:
+    """Return the last known machine timezone (may be None if never fetched)."""
+    return _machine_timezone_cache
 
 
 # ==============================================================================
@@ -280,12 +333,13 @@ def get_next_occurrence(schedule: dict) -> Optional[datetime]:
     Args:
         schedule: Recurring schedule dict with:
             - time: HH:MM format
+            - timezone: IANA tz name (e.g. "America/Los_Angeles"). Defaults to UTC.
             - recurrence_type: 'daily', 'weekdays', 'weekends', 'interval', 'specific_days'
             - interval_days: For 'interval' type, number of days between runs
             - days_of_week: For 'specific_days' type, list of day numbers (0=Monday)
     
     Returns:
-        Next datetime when the schedule should run, or None if invalid.
+        Next datetime (UTC) when the schedule should run, or None if invalid.
     """
     MAX_SCHEDULING_DAYS = 400  # Maximum ~1 year ahead to search for next occurrence
     
@@ -293,15 +347,32 @@ def get_next_occurrence(schedule: dict) -> Optional[datetime]:
         time_str = schedule.get("time", "07:00")
         hour, minute = map(int, time_str.split(":"))
         recurrence_type = schedule.get("recurrence_type", "daily")
-        
-        now = datetime.now(timezone.utc)
-        today = now.date()
-        
-        # Start checking from today
-        candidate = datetime(today.year, today.month, today.day, hour, minute, tzinfo=timezone.utc)
-        
-        # If today's time has passed, start from tomorrow
-        if candidate <= now:
+
+        # Resolve schedule's timezone. Precedence:
+        #   1. Explicit ``timezone`` on the schedule (user intent).
+        #   2. Cached machine ``time_zone`` from /api/v1/settings.
+        #   3. UTC fallback.
+        tz_name = schedule.get("timezone") or _machine_timezone_cache or "UTC"
+        try:
+            tz = ZoneInfo(tz_name)
+        except ZoneInfoNotFoundError:
+            logger.warning(
+                f"Unknown timezone '{tz_name}' for schedule {schedule.get('id')}, falling back to UTC"
+            )
+            tz = ZoneInfo("UTC")
+
+        # Work in the schedule's local timezone so HH:MM means local wall-clock time.
+        now_local = datetime.now(tz)
+        today_local = now_local.date()
+
+        # Start checking from today (in local tz)
+        candidate = datetime(
+            today_local.year, today_local.month, today_local.day,
+            hour, minute, tzinfo=tz,
+        )
+
+        # If today's time has passed locally, start from tomorrow
+        if candidate <= now_local:
             candidate += timedelta(days=1)
         
         # Find the next valid day based on recurrence type
@@ -309,11 +380,11 @@ def get_next_occurrence(schedule: dict) -> Optional[datetime]:
             weekday = candidate.weekday()  # 0=Monday, 6=Sunday
             
             if recurrence_type == "daily":
-                return candidate
+                return candidate.astimezone(timezone.utc)
             elif recurrence_type == "weekdays" and weekday < 5:  # Mon-Fri
-                return candidate
+                return candidate.astimezone(timezone.utc)
             elif recurrence_type == "weekends" and weekday >= 5:  # Sat-Sun
-                return candidate
+                return candidate.astimezone(timezone.utc)
             elif recurrence_type == "interval":
                 interval_days = schedule.get("interval_days", 1)
                 # Check if this day is valid based on last_run
@@ -325,18 +396,18 @@ def get_next_occurrence(schedule: dict) -> Optional[datetime]:
                         last_run_dt = datetime.fromisoformat(last_run_str)
                         days_since = (candidate - last_run_dt).days
                         if days_since >= interval_days:
-                            return candidate
+                            return candidate.astimezone(timezone.utc)
                     except (ValueError, AttributeError):
                         # Invalid datetime format - treat as no last run
                         logger.warning(f"Invalid last_run format for schedule {schedule.get('id')}: {last_run}")
-                        return candidate
+                        return candidate.astimezone(timezone.utc)
                 else:
                     # No last run, so this is the first run
-                    return candidate
+                    return candidate.astimezone(timezone.utc)
             elif recurrence_type == "specific_days":
                 days_of_week = schedule.get("days_of_week", [])
                 if weekday in days_of_week:
-                    return candidate
+                    return candidate.astimezone(timezone.utc)
             
             # Move to next day
             candidate += timedelta(days=1)
