@@ -42,11 +42,11 @@ _FLOAT_SENSORS = frozenset({
 })
 
 _BOOL_SENSORS = frozenset({
-    "brewing", "connected",
+    "brewing", "connected", "sounds_enabled",
 })
 
 _INT_SENSORS = frozenset({
-    "total_shots", "voltage",
+    "total_shots", "voltage", "brightness",
 })
 
 
